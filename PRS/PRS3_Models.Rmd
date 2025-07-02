@@ -1,0 +1,274 @@
+---
+title: "Models"
+subtitle: "Schizophrenia risk prediction_LMTV3"
+author:
+  - "Version: v1.0"
+  - "Author: Pol Ramon-Cañellas"
+  - "Updated by: Carla Arxé Asensio"
+date: "Date: `r format(Sys.time(), '%Y.%m.%d')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    toc_collapsed: yes
+    code_folding: hide
+    highlight: tango
+    bs_theme: cerulea
+  word_document:
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: 4
+---
+
+# INTRODUCTION TO SCRIPT
+SCRIPT PRUPOUSE: Check models for phenotype (Case/Control)(<https://bookdown.org/ndphillips/YaRrr/linear-regression-with-lm.html>)
+
+- Approach 0:
+  - 0.1: Binomial logistic regression model for phenotype (Case/Control), including covariates (PCs, Sex).
+  - 0.2: Binomial logistic regression model for phenotype (Case/Control), including PCA values (PRS-PC1).
+
+- Approach A: \n Binomial logistic regression model for phenotype (Case/Control), including covariates (PCs, Sex) and PCA values (PRS-PC1).
+    
+- Approach B:
+  - B1. Linear regression model for PRS-PC1 to get the residual (E) using the covariates (PCs, Sex).
+  - B2. Binomial logistic regression model for phenotype (Case/Control), using the PRS-PC1residual (E).
+
+```{r starting, echo=FALSE}
+# IMP: to free memory usage (when working with data requiring big amounts of memory)
+rm(list=ls(all.names=TRUE))
+invisible(gc())
+
+#Libraries suppressMessages(library(dplyr))
+suppressMessages(library(DescTools))
+suppressMessages(library(dplyr))
+suppressMessages(library(jtools))
+suppressMessages(library(purrr))
+suppressMessages(library(report))
+suppressMessages(library(sjPlot))
+suppressMessages(library(tidyr))
+
+# INPUTS and data.frame rearrangements:
+
+  # Phenotype (FID, IID, PHENOTYPE) 
+  df_pheno <- read.table("1J_FID.IID.PHENOTYPE.txt", header=TRUE, sep=" ")
+  df_pheno$FID_IID <- paste(df_pheno[,1], df_pheno[,2], sep="_|_")
+  df_pheno <- df_pheno[ , c(length(df_pheno), 3:(length(df_pheno)-1))]  
+  
+    # Later, for models, the phenotype variable must be "0" (change "1" in controls) and "1" (change "2" in cases).
+    #df_pheno[which(df_pheno$PHENOTYPE==1),"PHENOTYPE"] <- 0 
+    #df_pheno[which(df_pheno$PHENOTYPE==2), "PHENOTYPE"] <- 1
+  
+  # Covariances (FID, IID, SEX, PC1,..., PC10) 
+  df_cov <- read.table("1M_FID.IID.COVARIATES.txt", header=TRUE, sep=" ")
+  df_cov$FID_IID <- paste(df_cov[,1], df_cov[,2], sep="_|_")
+  df_cov <- df_cov[ , c(length(df_cov), 3:(length(df_cov)-1))]
+  
+  # PRS-PC1 (FID, IID, PRS.PC1)
+  df_prs.pc1 <- read.table("3_PRS_individuals_PC1.txt", header=TRUE, sep=" ")
+  names(df_prs.pc1)[names(df_prs.pc1)=="PC1"] <-"PRS.PC1"
+  df_prs.pc1$FID_IID <- paste(df_prs.pc1[,1], df_prs.pc1[,2], sep="_|_") 
+  df_prs.pc1 <- df_prs.pc1[ , c(length(df_prs.pc1), 3:(length(df_prs.pc1)-1))]
+  
+# MERGE ALL DATABASES
+l_all <- list("pheno"=df_pheno, "covariates"=df_cov, "prs.pc1"=df_prs.pc1) 
+df_all <- Reduce(function(x, y) merge(x, y, all=FALSE), l_all)
+rownames(df_all) <- df_all$FID_IID
+
+# PLOT DATA
+par(mfrow=c(2,3))
+for (i in seq_along(3:NCOL(df_all))) { 
+  plot(df_all[,c(2,i+2)]) 
+}
+```
+
+# APPROACH 0: \nBinomial logistic regression model for PHENOTYPE
+
+## 0.1: Including covariances (NULL).
+- Binary dependent variable: Phenotype (control '0' & case '1').
+- Independent variables: SEX & PCs.
+
+```{r aproach0.1, echo=FALSE}
+# MODEL 0.1: covariates (null)
+df_all_0 <- df_all
+mod_0.1 <- glm(formula = PHENOTYPE ~ SEX+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=df_all_0, family="binomial")
+mod_0.1_sum <- summary(mod_0.1)
+print(mod_0.1_sum)
+pseudor2_nagelkerke_0.1 <- PseudoR2(mod_0.1, which="Nagelkerke")
+cat(paste0("\nThe pseudo R2 for Nagelkerke is ", pseudor2_nagelkerke_0.1, ".\n "))
+mod_0.1_report <- report(mod_0.1)
+print(mod_0.1_report)
+```
+
+## 0.2: Including covariances and PRS-PC1
+- Binary dependent variable: Phenotype (control '0' & case '1').
+- Independent variables: SEX, PCs, & PRS-PC1.
+
+```{r aproach0.2, echo=FALSE}
+# MODEL 0.2: PRS-PC1.
+mod_0.2 <- glm(formula = PHENOTYPE ~ PRS.PC1, data=df_all_0, family="binomial")
+mod_0.2_sum <- summary(mod_0.2)
+print(mod_0.2_sum)
+pseudor2_nagelkerke_0.2 <- PseudoR2(mod_0.2, which="Nagelkerke")
+cat(paste0("\nThe pseudo R2 for Nagelkerke is ", pseudor2_nagelkerke_0.2, ".\n "))
+mod_0.2_report <- report(mod_0.2)
+print(mod_0.2_report)
+```
+
+
+# APPROACH A: \n Binomial logistic regression model ALL AT ONCE.
+
+- Binary dependent variable: Phenotype (control '0' & case '1'). 
+- Independent variables: SEX, PCs & PRS.PC1.
+
+```{r aproachA1, echo=FALSE}
+df_all_A <- df_all 
+mod_A1 <- glm(formula = PHENOTYPE ~ SEX+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+PRS.PC1, data=df_all_A, family="binomial")
+mod_A1_sum <- summary(mod_A1)
+print(mod_A1_sum)
+pseudor2_nagelkerke_A1 <- PseudoR2(mod_A1, which="Nagelkerke")
+cat(paste0("\nThe pseudo R2 for Nagelkerke is ", pseudor2_nagelkerke_A1, ".\n "))
+mod_A1_report <- report(mod_A1)
+print(mod_A1_report)
+
+#Check model fitting new predicted data. #Get the fitted values from the model and put them back in the dataset.
+df_all_A$pred.PHENOTYPE <- mod_A1$fitted.values 
+#Get the predictions of new data 
+logit.predictions<- predict(object=mod_A1) 
+#logit-transformed probabilities
+prob.predictions <- 1 / (1 + exp(-logit.predictions)) 
+# Apply inverse logit to transform to probabilities 
+prob.predictions <- as.data.frame(prob.predictions)
+
+#Plot original vs predicted values. 
+mod_A1_pheno.pred <- merge(df_all_A[,'PHENOTYPE', drop=FALSE], prob.predictions, by=0, all=TRUE)
+
+par(mfrow=c(2,2))
+
+h0 <- (hist(mod_A1_pheno.pred[which(mod_A1_pheno.pred$PHENOTYPE==0),3], main="Control (0) prediction", xlab="Prediction"))
+h0$density <- h0$counts/sum(h0$counts)*100
+plot(h0,freq=FALSE, main="Control (0) prediction", ylab="Density (%)", xlab="Prediction")
+
+h1 <- (hist(mod_A1_pheno.pred[which(mod_A1_pheno.pred$PHENOTYPE==1),3], main="Case (1) prediction", xlab="Prediction"))
+h1$density <- h1$counts/sum(h1$counts)*100
+plot(h1,freq=FALSE, main="Case (1) prediction", ylab="Density (%)", xlab="Prediction")
+```
+
+# APPROACH B: \n Linear regression model + Binomial logistic regresion model
+
+## B1. Linear regression model for PRS-PC1:
+- Dependent variable: PRS.PC1.
+- Independent variables: SEX & PCs.
+
+```{r aproachB1, echo=FALSE}
+df_all_B <- df_all
+mod_B1 <- lm(formula = PRS.PC1 ~ SEX+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=df_all_B)
+mod_B1_sum <- summary(mod_B1) 
+print(mod_B1_sum)
+mod_B1_report <- report(mod_B1)
+print(mod_B1_report)
+
+cat(paste0("The covariables (SEX & PCs) explains the ", sprintf("%0.1f%%", mod_B1_sum[["adj.r.squared"]]*100), " of the PRS.PC1"))
+cat(paste0("The residual (PRS.PC1.residual) explains the ", sprintf("%0.1f%%", (1-mod_B1_sum[["adj.r.squared"]])*100), " of the PRS.PC1"))
+
+#Check model fitting new predicted data. #Get the fitted values from the model and put them back in the dataset.
+df_all_B$pred.PHENOTYPE <- mod_B1$fitted.values 
+#Get the predictions of new data 
+logit.predictions<- predict(object=mod_B1) 
+#logit-transformed probabilities 
+prob.predictions <- 1 / (1 + exp(-logit.predictions)) 
+#Apply inverse logit to transform to probabilities 
+prob.predictions <- as.data.frame(prob.predictions)
+
+#Plot original vs predicted values. 
+mod_B_PRS.PC1.pred <- merge(df_all_B[,'PRS.PC1', drop=FALSE], prob.predictions, by=0, all=TRUE)
+
+par(mfrow=c(1,1))
+
+plot(mod_B_PRS.PC1.pred$PRS.PC1, mod_B_PRS.PC1.pred$prob.predictions, main="Prediction for PRS-PC1", xlab="PRS.PC1", ylab="prediction", xlim=c(min(mod_B_PRS.PC1.pred[,c(2,3)]), max(mod_B_PRS.PC1.pred[,c(2,3)])), ylim=c(min(mod_B_PRS.PC1.pred[,c(2,3)]), max(mod_B_PRS.PC1.pred[,c(2,3)])))
+
+# Get the residuals PRS-PC1-res 
+df_res <- as.data.frame(mod_B1$residuals)  
+colnames(df_res) <- "PRS.PC1.residual"  
+df_res$FID_IID <- rownames(df_res) 
+df_res <- df_res[,c(2,1)]
+
+#CONFIRM THAT PRS.PC1.residual IS NOT EXPLAINED BY COVARIABLES.
+df_mod.res <- merge(df_all, df_res, by=c("FID_IID"))
+
+mod_res <- lm(formula = PRS.PC1.residual ~ SEX+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=df_mod.res) 
+mod_res_sum <- summary(mod_res) 
+print(mod_res_sum)
+cat(paste0("The residual (PRS.PC1.residual) is NOT explained by covariances, as expected."))
+report(mod_res)
+```
+
+## B2. Binomial logistic regression model for phenotype (Case/Control):
+- Binary dependent variable: Phenotype (control '0' & case '1').
+- Independent variables: PRS.PC1.residual.
+
+```{r aproachB2, echo=FALSE}
+df_mod.B2 <- merge(df_pheno, df_res, by="FID_IID") 
+rownames(df_mod.B2) <- df_mod.B2$FID_IID
+
+mod_B2 <- glm(formula = PHENOTYPE ~ PRS.PC1.residual, data=df_mod.B2, family="binomial") 
+mod_B2_sum <- summary(mod_B2)
+print(mod_B2_sum)
+pseudor2_nagelkerke_B2 <- PseudoR2(mod_B2, which="Nagelkerke")
+cat(paste0("\nThe pseudo R2 for Nagelkerke is ", pseudor2_nagelkerke_B2, ".\n "))
+mod_B2_report <- report(mod_B2)
+print(mod_B2_report)
+
+#Check model fitting new predicted data. #Get the fitted values from the model and put them back in the dataset.
+df_mod.B2$pred.PHENOTYPE <- mod_B2$fitted.values 
+#Get the predictions of new data 
+logit.predictions <- predict(object=mod_B2) 
+#logit-transformed probabilities 
+prob.predictions <- 1 / (1 + exp(-logit.predictions)) 
+# Apply inverse logit to transform to probabilities
+prob.predictions <- as.data.frame(prob.predictions)
+
+#Plot original vs predicted values. 
+mod_B2_pheno.pred <- merge(df_mod.B2[,'PHENOTYPE', drop=FALSE], prob.predictions, by=0, all=TRUE)
+
+par(mfrow=c(2,2))
+
+h0 <- (hist(mod_B2_pheno.pred[which(mod_B2_pheno.pred$PHENOTYPE==0),3], main="Control prediction (0)", xlab="Prediction"))  
+h0$density <- h0$counts/sum(h0$counts)*100 
+plot(h0,freq=FALSE, main="Control prediction (0)", ylab="Density (%)", xlab="Prediction")
+
+h1 <- (hist(mod_B2_pheno.pred[which(mod_B2_pheno.pred$PHENOTYPE==1),3], main="Case prediction (1)", xlab="Prediction"))  
+h1$density <- h1$counts/sum(h1$counts)*100 
+plot(h1,freq=FALSE, main="Case prediction (1)", ylab="Density (%)", xlab="Prediction")
+
+```
+
+# COMPARISON OF APPROACHES
+
+Compare both approaches for the PHENOTYPE
+```{r comparison, echo=FALSE}
+models_sum <- sum(pseudor2_nagelkerke_B2, pseudor2_nagelkerke_0.1)
+if (between(pseudor2_nagelkerke_A1, models_sum-0.03, models_sum+0.03)) {
+  similar <- ""
+} else {
+  similar <- "NOT "
+}
+cat(paste0("The Nagelkerke pseudo R2 for the full model (A1) is ", pseudor2_nagelkerke_A1, ".\nWhich is ", similar, "similar to the sum of the PRS-PC1-residual model (B2), ", pseudor2_nagelkerke_B2, ", and the covariances model (0.1), ", pseudor2_nagelkerke_0.1, ", that sums ", models_sum, "."))
+
+
+#Summary:
+cat("#### SUMMARY OF MODELS ####")
+export_summs(mod_0.1, mod_0.2, mod_A1, mod_B1, mod_B2, model.names=c("Approach 0.1", "Approach 0.2", "Approach A1", "Approach B1", "Approach B2"))
+
+```
+
+```{r save, echo=FALSE}
+## Get from dataframe only PRS.PC1.residuals and separates FID_IID.
+  df_res <- df_res %>% separate_wider_delim(FID_IID, "_|_", names=c("FID", "IID"))
+  df_res <- as.data.frame(df_res)
+
+#Save data in files
+write.table(df_res, "3_PRS_PC1_res.txt", quote=FALSE, col.names=TRUE, row.names=FALSE)
+```
