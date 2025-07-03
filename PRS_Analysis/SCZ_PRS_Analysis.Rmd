@@ -1,0 +1,786 @@
+---
+title: "sz_prs_icd10_analysis"
+author: "Carla Arxé"
+date: "2025-05-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# INTRODUCTION TO SCRIPT
+SCRIPT PURPOSE: This script investigates the relationship between the polygenic risk score for schizophrenia (SCZ-PRS) and a wide range of medical conditions as coded in ICD-10, using data from the UK Biobank.
+
+# GENERAL GOAL:
+Evaluate how genetic risk for schizophrenia relates to health outcomes in the general population, both in individuals with mental health diagnoses (ICD-10 Chapter F) and those without.
+
+Specifically, this script:
+ 1. Merges SCZ-PRS residuals with ICD-10 diagnostic data from the UK Biobank.
+ 2. Constructs two datasets:
+    a. Full dataset including individuals with ICD-10 Chapter F diagnoses.
+    b. Filtered dataset excluding individuals with mental diagnoses (Chapter V).
+ 3. Analyzes the relationship between SCZ-PRS and disease prevalence:
+    a. Using individual ICD-10 codes and grouped ICD-10 categories.
+    b. Applying regression models (linear, log, exponential, power) and quantile analysis.
+ 4. Computes statistical and descriptive indicators
+
+# OVERVIEW OF APPROACHES:
+
+1. Load both files (PRS.PC1.residual and diagnostics). 
+2. Transform the diagnoses (X41270.0.*) to long format. 
+3. Extract the first 3 characters of the ICD-10 codes. 
+4. Merge the data with the PRS only for the individuals who have it. 
+5. Create two datasets: 
+- One complete 
+- One excluding patients from chapter V
+6. Generate a binary diagnosis matrix by code. 
+7. Create regression models by code with different types of fitting (linear, log, exponential). 
+8. Filter only codes with at least 100 cases. 
+9. Correct for multiple comparisons (FDR). 
+10. Prevalence study by 25 quantiles of PRS.
+
+```{r}
+# ========================
+# ==== LOAD LIBRARIES ====
+# ========================
+suppressMessages(library(dplyr))
+suppressMessages(library(tidyr))
+suppressMessages(library(stringr))
+suppressMessages(library(purrr))
+suppressMessages(library(broom))
+suppressMessages(library(ggplot2))
+suppressMessages(library(scales))
+suppressMessages(library(tidyverse))
+suppressMessages(library(gridExtra))
+suppressMessages(library(knitr))
+suppressMessages(library(kableExtra))
+suppressMessages(library(grid))
+suppressMessages(library(ggpubr))
+suppressMessages(library(pheatmap))
+suppressMessages(library(RColorBrewer))
+```
+
+```{r}
+rm(list=ls(all.names=TRUE))
+invisible(gc())
+```
+
+```{r}
+# ===================
+# ==== LOAD DATA ====
+# ===================
+df_prs <- read.table("3_PRS_PC1_res.txt", header = TRUE) 
+df_icd <- read.table("ukb668761_41270_wb.txt", 
+                     header = TRUE, 
+                     sep = "\t",                   
+                     fill = TRUE,
+                     quote = "",
+                     stringsAsFactors = FALSE,
+                     check.names = FALSE)    
+```
+
+```{r}
+### 2. Transform diagnostic data to long format
+df_icd_long <- df_icd %>%
+  select(-FID) %>%
+  pivot_longer(cols = starts_with("X41270"), names_to = "field", values_to = "code") %>%
+  filter(!is.na(code), code!="") %>%
+  mutate(code3 = substr(code, 1, 3 )) %>%
+  distinct(IID, code3)
+
+# Number of unique values in the column code3
+length(unique(df_icd_long$code3))
+```
+
+```{r}
+### 3. Create a binary matrix (one column for each 3-digit ICD-10 code)
+df_icd_bin <- df_icd_long %>%
+  mutate(present = 1) %>%
+  pivot_wider(names_from = code3, values_from = present, values_fill = 0)
+```
+
+```{r}
+### 4. Join with PRS
+df_all <- df_prs %>%
+  left_join(df_icd_bin, by = "IID")
+```
+
+```{r}
+### 5. Separate datasets 
+# Complete dataset
+df_with_F <- df_all
+
+# 1. Detecta todas las columnas que comienzan con "F"
+f_cols <- grep("^F", names(df_all), value = TRUE)
+f_cols <- setdiff(f_cols, "FID")
+
+# Dataset excluding F (chapter V)
+df_no_F <- df_all %>%
+  mutate(across(all_of(f_cols), ~ as.numeric(as.character(.x)))) %>%
+  filter(rowSums(select(., all_of(f_cols)), na.rm = TRUE) == 0) %>%
+  select(-all_of(f_cols))
+
+# Get list of codes
+icd_codes <- setdiff(names(df_all), c("FID", "IID", "PRS.PC1.residual"))
+```
+
+```{r}
+code_counts <- df_no_F %>%
+  select(-FID, -IID, -PRS.PC1.residual) %>%
+  summarise(across(everything(), ~ sum(.x, na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(), names_to = "code", values_to = "n_individuals")
+
+codes <- code_counts %>%
+  filter(n_individuals >= 100) %>%
+  pull(code)
+
+df_no_F_filtered <- df_no_F %>%
+  select(FID, IID, PRS.PC1.residual, all_of(codes))
+```
+
+```{r}
+### 8. Save results
+#write.csv(df_no_F_filtered, "df_no_F_filtered.csv", row.names = FALSE)
+#df_no_F_filtered <- read.csv("df_no_F_filtered.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+#5.1 check if it follows a normal distribution
+hist(df_no_F$PRS.PC1.residual, breaks = 30, main = "PRS Histogram", xlab = "PRS")
+```
+```{r}
+qqnorm(df_no_F$PRS.PC1.residual)
+qqline(df_no_F$PRS.PC1.residual, col = "red")
+```
+# MODEL ADJUST
+Objetivo:
+Evaluar, para cada diagnóstico (code), qué modelo (lineal, logarítmico, exponencial) se ajusta mejor.
+Comparar residuos para seleccionar el mejor modelo.
+Visualizarlo con un Manhattan plot por modelo, donde cada punto represente un diagnóstico (code) y el eje Y sea, por ejemplo:
+el -log10(p) de ese modelo (si pruebas significancia),
+o la R² (explicación de varianza),
+o el residual sum of squares (RSS) (para evaluar error).
+
+```{r}
+# Añadir columna de cuantiles a tu dataframe
+df_filtered <- df_no_F_filtered %>%
+  mutate(PRS_quantile = ntile(PRS.PC1.residual, 25))
+```
+
+```{r}
+# Identificar las columnas de diagnóstico: todas excepto ID y PRS
+diagnosis_cols <- setdiff(colnames(df_filtered), c("FID", "IID", "PRS.PC1.residual", "PRS_quantile"))
+
+# Pivot to long format
+df_long <- df_filtered %>%
+  pivot_longer(
+    cols = all_of(diagnosis_cols),
+    names_to = "code",
+    values_to = "diagnosis"
+  ) %>%
+  select(FID, IID, PRS_quantile, code, diagnosis) 
+
+# Calcular prevalencia y número de personas únicas por código y cuantil
+prevalence_by_quantile <- df_long %>%
+  group_by(code, PRS_quantile) %>%
+  summarise(
+    prevalence = mean(diagnosis, na.rm = TRUE),
+    n = n_distinct(IID),
+    cases = sum(diagnosis == 1, na.rm = TRUE),  # <-- número de diagnósticos positivos
+    .groups = "drop"
+  )
+
+# Verifica resultado
+head(prevalence_by_quantile)
+```
+
+```{r}
+# Renombrar para usar PRS en lugar de PRS_quantile
+prevalence_by_quantile <- prevalence_by_quantile %>%
+  rename(PRS = PRS_quantile)
+```
+
+```{r}
+#Identify columns with diagnosis F
+f_cols <- grep("^F", names(df_all), value = TRUE)
+
+# Seleccionar solo las columnas relevantes: excluir ID, IID, PRS
+cols_to_use <- setdiff(f_cols, c("FID", "IID", "PRS_qtile", "PRS.PC1.residual"))
+
+df_all_F <- df_all %>%
+  mutate(any_F = as.integer(rowSums(select(., all_of(cols_to_use)), na.rm = TRUE) > 0))
+
+code_interest <- "any_F"
+
+# 4. Plot
+# Calcular prevalence per quantils
+prevalence_plot_all_F <- df_all_F %>%
+  group_by(PRS_qtile) %>%
+  summarise(
+    N = n(),
+    n_affected = sum(.data[[code_interest]], na.rm = TRUE),
+    prevalence = n_affected / N
+  ) %>%
+  ggplot(aes(x = PRS_qtile, y = prevalence, group = 1)) +
+  geom_point(aes(color = prevalence), size = 2) +                                
+  geom_text(
+    data = . %>% filter(PRS_qtile %in% c(1, 25)),
+    aes(label = paste0(round(prevalence * 100, 1), "%")),
+    vjust = -1.2, size = 3.5
+  ) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), 
+              aes(group = 1), color = "steelblue", se = TRUE) +                 # Curva suavizada con IC
+  scale_color_viridis_c(option = "viridis", direction = -1, name = "Prevalence") +
+  scale_x_discrete(drop = FALSE) +                                              # Mostrar todos los cuantiles
+  labs(
+    title = paste("Prevalence of", "Mental and behavioural disorders", "by PRS"),
+    x = "PRS Quantile",
+    y = "Prevalence"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 10)
+  )
+
+# 5. Mostrar el gráfico
+prevalence_plot_all_F
+```
+
+#Prior ASSOCIATION
+```{r}
+### 6. Function for code analysis
+analyze_icd <- function(df, prs_col = "PRS.PC1.residual", min_n = 100) {
+  results <- map_dfr(icd_codes, function(code) {
+    n_case <- sum(df[[code]], na.rm = TRUE)
+    if (n_case < min_n) return(NULL)
+    
+    model_df <- df %>%
+      select(PRS = all_of(prs_col), diagnosis = all_of(code)) %>%
+      filter(!is.na(PRS))
+    
+    # Model
+    log_glm <- glm(diagnosis ~ log(PRS - min(PRS) + 1e-5), family = "binomial", data = model_df)
+    
+    tibble(
+      code = code,
+      n_cases = n_case,
+      beta = coef(log_glm)[2],
+      p_value = summary(log_glm)$coefficients[2, 4],
+      OR = exp(coef(log_glm)[2]),
+      SE = summary(log_glm)$coefficients[2, "Std. Error"]
+    )
+  })
+  
+  # Correcction by FDR
+  results <- results %>%
+    mutate(
+      p_value_adj = p.adjust(p_value, method = "fdr")
+    )
+  return(results)
+}
+```
+ 
+```{r}
+### 7. Execute analysis
+results_with_F <- analyze_icd(df_with_F)
+results_no_F <- analyze_icd(df_no_F)
+```
+
+```{r}
+### 8. Save results
+#write.csv(results_with_F, "results_with_F.csv", row.names = FALSE)
+#write.csv(results_no_F, "results_no_F.csv", row.names = FALSE)
+```
+
+```{r}
+#results_with_F <- read.csv("results_with_F.csv", stringsAsFactors = FALSE)
+#results_no_F <- read.csv("results_no_F.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+results_ordered_F <- results_no_F %>%
+  arrange(p_value_adj)
+```
+
+```{r}
+results_no_F_filter <- results_no_F %>%
+  dplyr::filter(p_value_adj < 0.05)
+```
+
+```{r}
+#False discovery rate
+# ---------------------
+# 2. Preparar columnas necesarias
+# ---------------------
+# Asigna letra del código ICD-10
+results_no_F <- results_no_F %>%
+  mutate(
+    chapter = str_sub(code, 1, 1),
+    chapter_name = case_when(
+      chapter == "A" | chapter == "B" ~ "Infecntious and parasitic",
+      chapter == "C" | chapter == "D" & as.numeric(str_sub(code, 2, 3)) <= 48 ~ "Neoplasms",
+      chapter == "D" ~ "Blood and hematopoietic organs",
+      chapter == "E" ~ "Endocrine, nutritional and metabolic",
+      chapter == "F" ~ "Mental and behavioural disorders",
+      chapter == "G" ~ "Nervous system",
+      chapter == "H" & as.numeric(str_sub(code, 2, 3)) <= 59 ~ "Eye and adnexa",
+      chapter == "H" ~ "Ear and mastoid process",
+      chapter == "I" ~ "Circulatory system",
+      chapter == "J" ~ "Respiratory system",
+      chapter == "K" ~ "Digestive system",
+      chapter == "L" ~ "Skin and subcutaneous tissue",
+      chapter == "M" ~ "Musculoskeletal system and connective tissue",
+      chapter == "N" ~ "Genitourinary system",
+      chapter == "O" ~ "Pregnancy, childbirth and the puerperium",
+      chapter == "P" ~ "Perinatal period",
+      chapter == "Q" ~ "Congenital malformations",
+      chapter == "R" ~ "Abnormal clinical and laboratory findings",
+      chapter == "S" | chapter == "T" ~ "Injury and poisoning",
+      chapter == "V" | chapter == "W" | chapter == "X" | chapter == "Y" ~ "External causes",
+      chapter == "Z" ~ "Factors influencing health status",
+      TRUE ~ "Codes for special purposes"
+    )
+  )
+
+data <- results_no_F %>%
+  mutate(
+    neg_log10_p = -log10(p_value_adj),
+    direction = ifelse(beta >= 0, "Positive", "Negative"),
+    index = row_number()
+  )
+
+threshold <- -log10(0.05)
+
+# 2. Crear una tabla con colores por capítulo
+chapters <- sort(unique(data$chapter))
+color_palette <- scales::hue_pal()(length(chapters))  # paleta de colores automáticos
+chapter_colors <- setNames(color_palette, chapters)   # nombrar por letra
+
+data <- data %>%
+  arrange(chapter_name) %>%
+  mutate(index = row_number())
+
+# ---------------------
+# 3. Crear gráfico
+# ---------------------
+# 🎨 Gráfico Manhattan con dirección y etiquetado
+ggplot(data, aes(x = index, y = neg_log10_p)) +
+  geom_point(aes(color = chapter_name, shape = direction), size = 3) +
+  geom_hline(yintercept = threshold, color = "red", linetype = "dashed") +
+  geom_text(
+    data = filter(data, neg_log10_p > threshold),
+    aes(label = code),
+    vjust = -1, size = 3
+  ) +
+  scale_shape_manual(values = c("Positive" = 24, "Negative" = 25)) +
+  labs(
+    title = "Manhattan Plot by ICD-10 (logistic model)",
+    x = "Phenotype",
+    y = expression(-log[10](p[adj])),
+    color = "",
+    shape = ""
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+
+```{r}
+# Adjust models
+
+# Funciones para obtener p-valores
+get_lm_pvalue <- function(model) {
+  fstat <- summary(model)$fstatistic
+  if (is.null(fstat)) return(NA_real_)
+  pf(fstat["value"], fstat["numdf"], fstat["dendf"], lower.tail = FALSE)
+}
+
+get_nls_b_pvalue <- function(model) {
+  tryCatch(
+    summary(model)$coefficients["b", "Pr(>|t|)"],
+    error = function(e) NA_real_
+  )
+}
+
+get_lm_r2 <- function(model) {
+  summary(model)$r.squared
+}
+
+get_nls_r2 <- function(model, data) {
+  if (is.null(model) || is.null(data)) return(NA_real_)
+  prevalence <- as.numeric(data$prevalence)
+  if (anyNA(prevalence)) return(NA_real_)  # Evita problemas con NAs
+  ss_res <- sum(residuals(model)^2)
+  ss_tot <- sum((prevalence - mean(prevalence))^2)
+  1 - ss_res / ss_tot
+}
+
+safe_nls <- safely(function(data) {
+  nls(prevalence ~ a * PRS^b, start = list(a = 1, b = 1), data = data)
+})
+
+# Models adjust
+model_fits <- prevalence_by_quantile %>%
+  group_by(code) %>%
+  nest() %>%
+  mutate(
+    lin_model = map(data, ~ lm(prevalence ~ PRS, data = .x)),
+    log_model = map(data, ~ lm(prevalence ~ log(PRS), data = .x)),
+    pw_model_raw = map(data, ~ safe_nls(.x)),
+    pw_model = map(pw_model_raw, "result"),
+    
+    # Nuevo modelo exponencial: log(prevalence) ~ PRS
+    exp_model = map(data, ~ {
+  data_clean <- .x %>% filter(prevalence > 0)
+  if (nrow(data_clean) < 2) return(NULL)  # evitar modelos con datos insuficientes
+  lm(log(prevalence) ~ PRS, data = data_clean)
+}),
+
+    aic_lin = map_dbl(lin_model, AIC),
+    aic_log = map_dbl(log_model, AIC),
+    aic_pw = map_dbl(pw_model, ~ if (!is.null(.x)) AIC(.x) else NA_real_),
+    aic_exp = map_dbl(exp_model, AIC),
+
+    rss_lin = map_dbl(lin_model, ~ sum(residuals(.x)^2)),
+    rss_log = map_dbl(log_model, ~ sum(residuals(.x)^2)),
+    rss_pw = map_dbl(pw_model, ~ if (!is.null(.x)) sum(residuals(.x)^2) else NA_real_),
+    rss_exp = map_dbl(exp_model, ~ sum(residuals(.x)^2))  # sobre log(prevalence)
+  )
+
+model_fits <- model_fits %>%
+  mutate(
+    r2_lin = map_dbl(lin_model, get_lm_r2),
+    r2_log = map_dbl(log_model, get_lm_r2),
+    r2_pw  = map2_dbl(pw_model, data, get_nls_r2),
+    r2_exp = map_dbl(exp_model, get_lm_r2)
+  )
+
+model_selection_with_p <- model_fits %>%
+  transmute(
+    code,
+    best_model = pmap_chr(
+      list(r2_lin, r2_log, r2_pw, r2_exp),
+      ~ c("linear", "log", "power", "exp_lm")[which.max(c(...))]
+    ),
+    min_rss = pmap_dbl(list(rss_lin, rss_log, rss_pw, rss_exp), ~ min(c(...))),
+    aic_diff = pmap_dbl(list(aic_lin, aic_log, aic_pw, aic_exp), ~ min(c(...)) - max(c(...))),
+
+    p_value = pmap_dbl(
+      list(best_model, lin_model, log_model, pw_model, exp_model),
+      function(model_type, lin, log, pw, exp) {
+        if (model_type == "linear")  return(get_lm_pvalue(lin))
+        if (model_type == "log")     return(get_lm_pvalue(log))
+        if (model_type == "power")   return(get_nls_b_pvalue(pw))
+        if (model_type == "exp_lm")  return(get_lm_pvalue(exp))
+      }
+    ),
+
+    r_squared = pmap_dbl(
+  list(best_model, lin_model, log_model, pw_model, exp_model, data),
+  function(model_type, lin, log, pw, exp, dat) {
+    if (is.null(dat)) return(NA_real_)
+    if (model_type == "linear") return(get_lm_r2(lin))
+    if (model_type == "log")    return(get_lm_r2(log))
+    if (model_type == "power")  return(get_nls_r2(pw, dat))
+    if (model_type == "exp_lm")    return(get_lm_r2(exp))
+    NA_real_
+  }
+    ),
+  
+  coef_estimate = pmap_dbl(
+      list(best_model, lin_model, log_model, pw_model, exp_model),
+      function(model_type, lin, log, pw, exp) {
+        if (model_type == "linear") return(coef(lin)[["PRS"]])
+        if (model_type == "log")    return(coef(log)[["log(PRS)"]])
+        if (model_type == "power") {
+          if (is.null(pw)) return(NA_real_)
+          return(coef(pw)[["b"]])
+        }
+        if (model_type == "exp_lm") return(coef(exp)[["PRS"]])
+        NA_real_
+      }
+    )
+    ) %>%
+  select(code, best_model, coef_estimate, min_rss, aic_diff, p_value, r_squared)
+
+
+model_selection_with_p_adj <- model_selection_with_p %>%
+  ungroup() %>%
+  mutate(p_value_adj = p.adjust(p_value, method = "fdr"))
+
+model_selection_adj <- model_selection_with_p_adj %>%
+  filter(p_value_adj < 0.05)  %>%
+  arrange(p_value_adj)  %>%
+  select(
+    1:5,
+    7,
+    6,
+    8
+  )
+
+model_selection <- model_selection_adj %>%
+  filter(r_squared > 0.45)
+
+#write.csv(model_selection_adj, "table.csv", row.names = FALSE)
+```
+
+```{r}
+#Model_selection table
+model_selection <- model_selection %>%
+  mutate(code_names = recode(code,
+    "J43" = "J43: Emphysema",
+    "K92" = "K92: Other digestive diseases",
+    "M18" = "M18: Arthrosis of first carpometacarpal joint",
+    "M65" = "M65: Synovitis and tenosynovitis",
+    "M17" = "M17: Knee Osteoarthritis",
+    "E11" = "E11: Type 2 Diabetes",
+    "E66" = "E66: Obesity",
+    "N17" = "N17: Acute Renal Failure",
+    "G56" = "G56: Mononeuropathies of upper limb",
+    "K59" = "K59: Other intestinal disorders",
+    "Z37" = "Z37: Childbirth",
+    "R10" = "R10: Abdominal Pain",
+    "M23" = "M23: Internal derangement of knee",
+    "M19" = "M19: Other arthrosis",
+    "K62" = "K62: Anal and rectum disorders"
+  ))
+```
+
+```{r}
+#Heatmap
+# Afegim columna de controls
+prev_df <- prevalence_by_quantile %>%
+  mutate(controls = n - cases)
+
+prev_df <- prev_df %>%
+  rename(PRS_quantile = PRS)
+
+#filtrem per aquells que tenen el model significatiu
+prev_df_filtered <- prev_df %>%
+  semi_join(model_selection, by = "code")
+
+# 1. Calcular OR (referencia Q13)
+calculate_or_vs_q13_fast <- function(df, ref_quantile = 13) {
+  df <- df %>%
+    mutate(PRS = factor(PRS_quantile, levels = sort(unique(PRS_quantile)))) %>%
+    mutate(PRS = relevel(PRS, ref = as.character(ref_quantile)))
+  
+  model <- glm(cbind(cases, controls) ~ PRS, data = df, family = binomial)
+  
+  broom::tidy(model, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(quantile = as.integer(gsub("PRS", "", term))) %>%
+    select(quantile, estimate, p.value) %>%
+    bind_rows(tibble(quantile = ref_quantile, estimate = 1, p.value = NA)) %>%
+    arrange(quantile)
+}
+
+# Calculate OR vs Q13
+or_by_code_q13 <- prev_df_filtered %>%
+  group_by(code) %>%
+  group_modify(~ calculate_or_vs_q13_fast(.x)) %>%
+  ungroup()
+
+# Prepare matrix for heatmap
+df_or <- or_by_code_q13 %>%
+  mutate(logOR = log(estimate))  # Optional: log-transform
+
+or_matrix <- df_or %>%
+  select(code, quantile, estimate) %>%
+  pivot_wider(names_from = quantile, values_from = estimate) %>%
+  column_to_rownames("code")
+
+# Replace these mappings with your actual disease names
+code_names <- c("J43" = "J43: Emphysema", 
+                "K92" = "K92: Other digestive diseases", 
+                "M18" = "M18: Arthrosis of first carpometacarpal joint", 
+                "M65" = "M65: Synovitis and tenosynovitis", 
+                "M17" = "M17: Knee Osteoarthritis", 
+                "E11" = "E11: Type 2 Diabetes", 
+                "E66" = "E66: Obesity", 
+                "N17" = "N17: Acute Renal Failure", 
+                "G56" = "G56: Mononeuropathies of upper limb", 
+                "K59" = "K59: Other intestinal disorders", 
+                "Z37" = "Z37: Childbirth", 
+                "R10" = "R10: Abdominal Pain", 
+                "M23" = "M23: Internal derangement of knee", 
+                "M19" = "M19: Other arthrosis", 
+                "K62" = "K62: Anal and rectum disorders")
+
+rownames(or_matrix) <- ifelse(rownames(or_matrix) %in% names(code_names), 
+                              code_names[rownames(or_matrix)], 
+                              rownames(or_matrix))
+
+# Define color palette centered at OR = 1
+breaks <- seq(min(or_matrix, na.rm = TRUE), max(or_matrix, na.rm = TRUE), length.out = 100)
+color_palette <- colorRampPalette(c("blue", "white", "red"))(length(breaks) - 1)
+
+# Rename quantile columns to Q1, Q2, ..., Q25
+colnames(or_matrix) <- paste0("Q", colnames(or_matrix))
+
+# Plot heatmap
+pheatmap(or_matrix,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         main = "OR by PRS Quantile (Ref: Q13)",
+         fontsize_row = 10,
+         fontsize_col = 10,
+         color = color_palette,
+         breaks = breaks,
+         border_color = NA,
+         angle_col = 45,  # Rotate quantile labels for readability
+         legend_breaks = c(min(breaks), 1, max(breaks)),
+         legend_labels = c("0.6", "OR = 1", "1.3"))
+```
+
+```{r}
+#Volcano Plot
+prev_df %>% split(., .$code) %>% lapply(function(mindf){
+  q0 <- subset(mindf, PRS_quantile == 1) %>% select(cases, controls)
+  qother <- subset(mindf, PRS_quantile != 1) %>% summarise_at(c('cases', 'controls'), sum)
+  tt <- rbind(q0, qother) 
+  rownames(tt) <- c('Q1', 'Other') 
+  tt %>% as.matrix %>% fisher.test() -> tt
+  return(c('pvalue' = tt$p.value, 'X2' = tt$estimate))
+
+}) -> tt_2
+tt_2 <- do.call('rbind', tt_2) %>% as.data.frame
+tt_2$code <- rownames(tt_2)
+colnames(tt_2)[2] <- 'OR'
+
+tt_2$signif <- tt_2$pvalue <= 0.05
+tt_2$adj.pvalue <- p.adjust(tt_2$pvalue)
+tt_2$adj.signif <- tt_2$adj.pvalue <= 0.05
+tt_2$sign.label <- ifelse(tt_2$adj.signif, '**', ifelse(tt_2$signif, '*', ''))
+
+tt_2 <- tt_2 %>%
+  mutate(
+    chapter = str_sub(code, 1, 1),
+    chapter_name = case_when(
+      chapter %in% c("A", "B") ~ "Infectious and parasitic",
+      chapter %in% c("C", "D") & as.numeric(str_sub(code, 2, 3)) <= 48 ~ "Neoplasms",
+      chapter == "D" ~ "Blood and hematopoietic organs",
+      chapter == "E" ~ "Endocrine, nutritional and metabolic",
+      chapter == "F" ~ "Mental and behavioural disorders",
+      chapter == "G" ~ "Nervous system",
+      chapter == "H" & as.numeric(str_sub(code, 2, 3)) <= 59 ~ "Eye and adnexa",
+      chapter == "H" ~ "Ear and mastoid process",
+      chapter == "I" ~ "Circulatory system",
+      chapter == "J" ~ "Respiratory system",
+      chapter == "K" ~ "Digestive system",
+      chapter == "L" ~ "Skin and subcutaneous tissue",
+      chapter == "M" ~ "Musculoskeletal system and connective tissue",
+      chapter == "N" ~ "Genitourinary system",
+      chapter == "O" ~ "Pregnancy, childbirth and the puerperium",
+      chapter == "P" ~ "Perinatal period",
+      chapter == "Q" ~ "Congenital malformations",
+      chapter == "R" ~ "Abnormal clinical and laboratory findings",
+      chapter %in% c("S", "T") ~ "Injury and poisoning",
+      chapter %in% c("V", "W", "X", "Y") ~ "External causes",
+      chapter == "Z" ~ "Factors influencing health status",
+      TRUE ~ "Codes for special purposes"
+    )
+  )
+
+
+# Plot
+ggplot(tt_2, aes(x = log2(OR), y = -log10(pvalue), color = chapter_name)) +
+  
+  # Points by ICD chapter
+  geom_point(alpha = 0.8, size = 2, show.legend = TRUE) +
+
+  # Horizontal line for p = 0.05
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+
+  # Vertical line for OR = 1 (log2(OR) = 0)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "darkred", linewidth = 0.8) +
+
+  # Labels for adj.signif in black
+  geom_text(data = subset(tt_2, adj.signif), 
+            aes(label = code), 
+            color = "black", 
+            size = 4, 
+            vjust = -0.5,
+            show.legend = FALSE) +
+
+  # Labels for signif but not adj.signif in light gray
+  geom_text(data = subset(tt_2, signif & !adj.signif), 
+            aes(label = code), 
+            color = "gray", 
+            size = 4, 
+            vjust = -0.5,
+            show.legend = FALSE) +
+
+  # Axis labels and title
+  labs(
+    title = "Odds Ratio (Q1 vs Others)",
+    x = "log2(Odds Ratio)",
+    y = "-log10(p-value)",
+    color = "ICD Chapter"
+  ) +
+
+  # Theme adjustments
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+#Or table
+selected_codes <- c("E11", "E66", "G56", "J43", "K59", "K62", "K92", "M17",
+                    "M18", "M19", "M23", "M65", "N17", "R10", "Z37")
+
+# Función para extraer OR, CI y p-valor del test de Fisher
+get_fisher_summary <- function(code_input) {
+  df_code <- df_long %>%
+    filter(code == code_input) %>%
+    mutate(quantil = if_else(PRS_quantile == 1, "Q1", "Others"))
+
+  contingency <- df_code %>%
+    group_by(quantil) %>%
+    summarise(
+      cases = sum(diagnosis == 1, na.rm = TRUE),
+      controls = sum(diagnosis == 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Build 2x2 matrix
+  mat <- matrix(c(contingency$cases, contingency$controls), nrow = 2, byrow = TRUE)
+
+  # Fisher test
+  result <- tryCatch({
+    ft <- fisher.test(mat)
+    tibble(
+      code = code_input,
+      OR = round(unname(ft$estimate), 2),
+      CI = paste0("[", round(ft$conf.int[1], 2), ", ", round(ft$conf.int[2], 2), "]"),
+      p_value = signif(ft$p.value, 3)
+    )
+  }, error = function(e) {
+    tibble(code = code_input, OR = NA, CI = NA, p_value = NA)
+  })
+
+  return(result)
+}
+
+# Aplicar a todos los códigos
+summary_fisher <- map_df(selected_codes, get_fisher_summary)
+
+# Mostrar
+print(summary_fisher)
+```

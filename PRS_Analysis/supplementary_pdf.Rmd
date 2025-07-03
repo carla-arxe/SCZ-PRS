@@ -1,0 +1,420 @@
+---
+title: "PDF - Supplementary"
+author: "Carla Arxé"
+date: "2025-06-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+minimal_table_theme <- function(tg) {
+  if (!inherits(tg, "gtable")) return(tg)
+
+  for (i in seq_along(tg$grobs)) {
+    g <- tg$grobs[[i]]
+    if (inherits(g, "text")) {
+      g$gp <- gpar(fontsize = 9, fontfamily = "sans")
+      tg$grobs[[i]] <- g
+    }
+  }
+
+  return(tg)
+}
+
+
+analyze_code <- function(df, df_all, df_long, code_name) {
+  df_code <- df %>% filter(code == code_name)
+  
+  df_all$PRS_quantile <- factor(df_all$PRS_quantile, levels = sort(unique(df_all$PRS_quantile)))
+  code_interest <- code_name
+
+prevalence_plot <- df_all %>%
+  group_by(PRS_quantile) %>%
+  summarise(
+    N = n(),
+    n_affected = sum(.data[[code_interest]], na.rm = TRUE),
+    prevalence = n_affected / N
+  ) %>%
+  ggplot(aes(x = PRS_quantile, y = prevalence, group = 1)) +
+  geom_point(aes(color = prevalence), size = 2) +                                
+  geom_text(
+    data = . %>% filter(PRS_quantile %in% c(1, 25)),
+    aes(label = paste0(round(prevalence * 100, 1), "%")),
+    vjust = -1.2, size = 3.5
+  ) +
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), 
+              aes(group = 1), color = "steelblue", se = TRUE) +                 # Curva suavizada con IC
+  scale_color_viridis_c(option = "viridis", direction = -1, name = "Prevalence") +
+  scale_x_discrete(drop = FALSE) +                                              # Mostrar todos los cuantiles
+  labs(
+    title = paste("FIGURE 1:Prevalence of", code_interest, "across SCZ-PRS quantile:"),
+    x = "PRS Quantile",
+    y = "Prevalence"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 10)
+  )
+
+  # === Model fitting ===
+  lin_model <- lm(prevalence ~ PRS, data = df_code)
+  log_model <- lm(prevalence ~ log(PRS), data = df_code)
+  power_model <- tryCatch({
+    nls(prevalence ~ a * PRS^b, data = df_code, start = list(a = 1, b = 1))
+  }, error = function(e) NULL)
+  exp_lm_model <- lm(log(prevalence) ~ PRS, data = df_code)
+  
+  pred_exp_lm <- exp(predict(exp_lm_model))
+
+  # === Metrics ===
+metrics <- tibble(
+  Model = c("Linear", "Log", "Exponential (lm)"),
+  AIC = c(AIC(lin_model), AIC(log_model), AIC(exp_lm_model)),
+  RSS = c(
+    sum(residuals(lin_model)^2),
+    sum(residuals(log_model)^2),
+    sum((df_code$prevalence - pred_exp_lm)^2)
+  ),
+  R2 = c(
+    summary(lin_model)$r.squared,
+    summary(log_model)$r.squared,
+    1 - sum((df_code$prevalence - pred_exp_lm)^2) / sum((df_code$prevalence - mean(df_code$prevalence))^2)
+  )
+) %>%
+  arrange(AIC) %>%
+  mutate(Rank = row_number()) %>%
+  relocate(Rank)
+
+  if (!is.null(power_model)) {
+    metrics <- metrics %>%
+      add_row(
+        Model = "Power",
+        AIC = AIC(power_model),
+        RSS = sum(residuals(power_model)^2),
+        R2 = 1 - sum(residuals(power_model)^2) / sum((df_code$prevalence - mean(df_code$prevalence))^2)
+      )
+  }
+
+  metrics <- metrics %>%
+    arrange(AIC) %>%
+    mutate(Rank = row_number()) %>%
+    relocate(Rank)
+
+
+  # === Predictions and residuals ===
+  df_pred <- df_code %>%
+    mutate(
+      pred_linear = predict(lin_model),
+      pred_log = predict(log_model),
+      pred_power = if (!is.null(power_model)) predict(power_model) else NA,
+      pred_exp_lm = exp(predict(exp_lm_model)),
+      residuals_linear = residuals(lin_model),
+      residuals_log = residuals(log_model),
+      residuals_exp_lm = prevalence - (exp(predict(exp_lm_model))),
+      residuals_power = if (!is.null(power_model)) residuals(power_model) else NA
+    )
+
+  # === Model fit plot ===
+
+plot_model <- ggplot(df_pred, aes(x = factor(PRS, levels = sort(unique(PRS))), y = prevalence)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_line(aes(y = pred_linear, color = "Linear", group = 1), linewidth = 1) +
+  geom_line(aes(y = pred_log, color = "Log", group = 1), linewidth = 1) +
+  geom_line(aes(y = pred_power, color = "Power", group = 1), linetype = "dotdash", linewidth = 1) +
+  geom_line(aes(y = pred_exp_lm, color = "Exponential", group = 1), linetype = "dashed", linewidth = 1) +
+  scale_color_manual(values = c("Linear" = "#8A2BE2", "Log" = "#ff7f00", "Power" = "#0072B2",  "Exponential" = "#009E73" )) +
+  labs(
+    title = paste("FIGURE 2: Prevalence by SCZ-PRS Quantile and Model Fit\nDiagnosis:", code_name),
+    x = "PRS Quantile",
+    y = "Prevalence",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 14)
+  )
+
+  # === Residual plot ===
+  df_resid <- df_pred %>%
+    select(PRS, residuals_linear, residuals_log, residuals_power, residuals_exp_lm) %>%
+    pivot_longer(cols = starts_with("residuals"),
+                 names_to = "model", values_to = "resid") %>%
+    mutate(model = recode(model,
+                          "residuals_linear" = "Linear",
+                          "residuals_log" = "Log",
+                          "residuals_power" = "Power",
+                          "residuals_exp_lm" = "Exponential"))
+
+plot_resid <- ggplot(df_resid, aes(x = factor(PRS), y = resid, color = model)) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c("Linear" = "#8A2BE2", "Log" = "#ff7f00", "Power" = "#0072B2", "Exponential" = "#009E73")) +
+  labs(title = paste("FIGURE 3: Model residuals by SCZ-PRS Quantile\nDiagnosis:", code_name), 
+      x = "PRS Quantile", y = "Residual", color = "Model") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 14)
+  )
+
+  # === Chi2 Test (Q1 vs others) ===
+  df_chi <- df_long %>%
+    filter(code == code) %>%
+    mutate(
+    quantil = if_else(PRS_quantile == 1, "Q1", "Others"),
+    quantil = factor(quantil, levels = c("Q1", "Others"))
+    )
+
+  table_chi <- df_chi %>%
+    group_by(quantil) %>%
+    summarise(
+      cases = sum(diagnosis == 1, na.rm = TRUE),
+      no_cases = sum(diagnosis == 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  matrix_chi2 <- matrix(c(table_chi$cases, table_chi$no_cases), nrow = 2, byrow = TRUE)
+
+  chi2_result <- tryCatch({
+    if (any(matrix_chi2 == 0) || any(matrix_chi2 < 5)) {
+      fisher.test(matrix_chi2)
+    } else {
+      chisq.test(matrix_chi2)
+    }
+  }, error = function(e) NULL)
+
+  # OR Q1 vs others
+  or_result <- tryCatch({
+  fisher_test <- fisher.test(matrix_chi2)
+  c(OR = unname(fisher_test$estimate), 
+    CI_lower = fisher_test$conf.int[1],
+    CI_upper = fisher_test$conf.int[2],
+    p.value = fisher_test$p.value)
+  }, error = function(e) c(OR = NA, CI_lower = NA, CI_upper = NA, p.value = NA))
+
+
+  # === Odds Ratio ===
+  df_or <- df_code %>%
+    mutate(non_cases = n - cases) %>%
+    pivot_longer(c(cases, non_cases), names_to = "status", values_to = "count") %>%
+    mutate(disease = ifelse(status == "cases", 1, 0)) %>%
+    uncount(count)
+  
+quantile_ref <- 13
+
+# Convert PRS to factor with reference in the central quantile
+df_code <- df_code %>%
+  mutate(PRS = factor(PRS, levels = sort(unique(PRS)))) %>%
+  mutate(PRS = relevel(PRS, ref = as.character(quantile_ref)))
+
+# Adjust the model with the new reference
+model_or <- glm(cbind(cases, n - cases) ~ PRS, data = df_code, family = binomial)
+
+# Create the ORs table
+or_table <- broom::tidy(model_or, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(quantile = as.integer(gsub("PRS", "", term))) %>%
+  select(quantile, estimate, conf.low, conf.high) %>%
+  bind_rows(tibble(quantile = quantile_ref, estimate = 1, conf.low = 1, conf.high = 1)) %>%
+  arrange(quantile)
+
+or_table_plot <- or_table %>%
+  mutate(is_ref = quantile == quantile_ref)
+
+# === Plot OR ===
+plot_or <- ggplot(or_table_plot, aes(x = factor(quantile), y = estimate , fill = is_ref)) +
+  geom_point(shape = 22, size = 3, color = "black") +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "darkred", size = 0.7) +
+  scale_fill_manual(values = c(`TRUE` = "#fdae61", `FALSE` = "#2c7bb6"), guide = "none") +
+  labs(
+    title = paste("FIGURE 4: Odds Ratio by SCZ-PRS quantile (Reference = Quantile",quantile_ref, ")\nDiagnosis:", code_name),
+    x = "PRS Quantile",
+    y = "Odds Ratio"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(size = 14)
+  )
+
+  # === Model summaries (text) ===
+  summary_lin <- capture.output(summary(lin_model))
+  summary_log <- capture.output(summary(log_model))
+  summary_exp <- capture.output(summary(exp_lm_model))
+  summary_power <- if (!is.null(power_model)) capture.output(summary(power_model)) else "Power model did not converge"
+
+  return(list(
+    code = code_name,
+    df_code = df_code,
+    prevalence_plot = prevalence_plot,
+    metrics = metrics,
+    df_pred = df_pred,
+    plot_model = plot_model,
+    plot_resid = plot_resid,
+    plot_or = plot_or,
+    summary_lin = summary_lin,
+    summary_log = summary_log,
+    summary_exp = summary_exp,
+    summary_power = summary_power,
+    table_chi = table_chi,
+    chi2_result = chi2_result,
+    odds_table = or_table,
+    or_result = or_result
+  ))
+}
+
+# ===== PDF =====
+#all_codes <- unique(prevalence_by_quantile$code)
+all_codes <- c("K92","E11")
+
+pdf("model_analysis_results_ek_v2.pdf", width = 10, height = 12)
+
+
+for (code in all_codes) {
+  result <- analyze_code(prevalence_by_quantile_ek,df_filtered, df_long_ek, code)
+  
+  # ========= PAGE 1: TITLE + PLOT =========
+    grid.newpage()
+  grid.text(paste("Prevalence analysis and model fitting for diagnosis:", result$code),
+            gp = gpar(fontsize = 16, fontface = "bold"),
+            y = unit(0.96, "npc"))
+  
+  # Crear un viewport en la mitad superior de la página
+vp_top_half <- viewport(y = 0.75, height = 0.5, width = 1, just = "top")
+
+pushViewport(vp_top_half)
+grid.draw(ggplotGrob(result$prevalence_plot))
+popViewport()
+
+  # ========= PAGE 2: TABLES =========
+  grid.newpage()
+  
+  prev_table <- result$df_code %>%
+  mutate(PRS = as.numeric(as.character(PRS)),
+         prevalence = round(prevalence,5)) %>% 
+  select(PRS, prevalence) %>%
+  arrange(PRS) %>%
+  rename(
+    `PRS Quantile` = PRS,
+    Prevalence = prevalence) %>%
+    tableGrob(rows = NULL) 
+
+  prev_table <- minimal_table_theme(prev_table)
+  
+  grid.text("Table 1 | Prevalence table by SCZ-PRS quantile", y = 0.93, gp = gpar(fontsize = 10))
+
+  pushViewport(viewport(y = 0.85, height = 0.5, just = "top"))
+  grid.draw(prev_table)
+  popViewport()
+
+  # Metrics table
+  metrics_df <- result$metrics
+  colnames(metrics_df) <- c("", "Model", "AIC", "RSS", "R2")
+  metrics_table <- tableGrob(metrics_df, rows = NULL)
+  metrics_table <- minimal_table_theme(metrics_table)
+  
+  grid.text("TABLE 2 | Model fit comparison for SCZ-PRS quantiles and diagnosis prevalence:", y = 0.27, gp = gpar(fontsize = 10))
+
+  pushViewport(viewport(y = 0.30, height = 0.2, just = "top"))
+  grid.draw(metrics_table)
+  popViewport()
+
+  # ========= PAGE 3: MODEL Y RESIDUALS =========
+  grid.arrange(result$plot_model, result$plot_resid,
+               ncol = 1, heights = c(1, 1))
+
+  # ========= PAGE 4: CHI2 TEST =========
+  grid.newpage()
+
+text_to_print <- paste(
+  "Chi2 Test for code:", result$code, "\n\n",
+  "TABLE 3 | Contingency table of diagnosis by SCZ-PRS quantile group (Q1 vs. others):\n", "\n\n"
+  )
+
+grid.text(text_to_print, x = 0.05, y = 0.95, just = c("left", "top"), gp = gpar(fontsize = 10, fontfamily = "mono"))
+
+  table_chi <- result$table_chi
+  colnames(table_chi) <- c("Quantile", "Cases", "Controls")
+  chi_table <- tableGrob(table_chi, rows = NULL)
+  chi_table <- minimal_table_theme(chi_table)
+
+  pushViewport(viewport(x = 0.2, y = 0.93, height = 0.2, just = "top"))
+  grid.draw(chi_table)
+  popViewport()
+  
+or_value <- round(result$or_result["OR"], 3)
+ci_lower <- round(result$or_result["CI_lower"], 3)
+ci_upper <- round(result$or_result["CI_upper"], 3)
+
+or_text <- paste0("OR (Q1 vs Others): ", or_value,
+                  "  [95% CI: ", ci_lower, " - ", ci_upper, "]")
+
+
+grid.text(or_text, x = 0.05, y = 0.75, just = c("left", "top"), gp = gpar(fontsize = 10, fontfamily = "mono"))
+
+
+text_to_print_2 <- paste(
+  "Test Result:\n",
+  if (!is.null(result$chi2_result)) paste(capture.output(print(result$chi2_result)), collapse = "\n") else "Test could not be computed")
+
+grid.text(text_to_print_2, x = 0.05, y = 0.70, just = c("left", "top"), gp = gpar(fontsize = 10, fontfamily = "mono"))
+
+  # ========= PAGE 5: OR PLOT =========
+  grid.newpage()
+
+  plot_or_grob <- ggplotGrob(result$plot_or)
+
+  vp <- viewport(y = 0.75, height = 0.5, width = 1, just = "top")
+
+  pushViewport(vp)
+  grid.draw(plot_or_grob)
+  popViewport()
+
+  # ========= PAGE 6: OR TABLE =========
+  grid.newpage()
+  table_odds <- result$odds_table
+  colnames(table_odds) <- c("PRS Quantile", "Odds Ratio", "CI Lower", "CI Upper")
+  or_table_grob <- tableGrob(table_odds %>%
+                               mutate(across(where(is.numeric), round, 2)),
+                             rows = NULL)
+  or_table_grob <- minimal_table_theme(or_table_grob)
+
+  grid.text("TABLE 4 | Odds Ratios by SCZ-PRS Quantile (ref = Q13)",
+            gp = gpar(fontsize = 10),
+            y = unit(0.93, "npc"))
+
+  pushViewport(viewport(y = 0.60, height = 0.8, just = "center"))
+  grid.draw(or_table_grob)
+  popViewport()
+
+  # ========= PAGE 7: MODEL SUMMARIES =========
+  grid.newpage()
+  summary_text <- c(
+    paste("Linear Model Summary for", result$code),
+    result$summary_lin, "",
+    paste("Log Model Summary for", result$code),
+    result$summary_log, "",
+      paste("Exponential Model Summary for", result$code),
+    result$summary_exp, "",
+    paste("Power Model Summary for", result$code),
+    result$summary_power
+  )
+
+  summary_grob <- grid::textGrob(paste(summary_text, collapse = "\n"),
+                                 x = unit(0.05, "npc"), y = unit(0.95, "npc"),
+                                 just = c("left", "top"),
+                                 gp = grid::gpar(fontsize = 7, fontfamily = "mono"))
+  grid.draw(summary_grob)
+}
+
+dev.off()
+```
